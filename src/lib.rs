@@ -129,6 +129,21 @@ impl Client {
         &self.api_base_url
     }
 
+    /// Returns the Physics-Lab client version used for authentication.
+    pub fn plar_version(&self) -> u32 {
+        self.plar_version
+    }
+
+    /// Returns the device identifier used for authentication.
+    pub fn device_id(&self) -> &str {
+        &self.device_id
+    }
+
+    /// Returns the language used for authentication.
+    pub fn language(&self) -> &str {
+        &self.language
+    }
+
     /// Logs in anonymously and returns the session and current-user snapshot.
     ///
     /// The returned session borrows this client and therefore cannot outlive it.
@@ -458,9 +473,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(client.api_base_url().as_str(), "http://127.0.0.1:3000/api/");
-        assert_eq!(client.plar_version, 2501);
-        assert_eq!(client.device_id, "test-device");
-        assert_eq!(client.language, "English");
+        assert_eq!(client.plar_version(), 2501);
+        assert_eq!(client.device_id(), "test-device");
+        assert_eq!(client.language(), "English");
     }
 
     #[test]
