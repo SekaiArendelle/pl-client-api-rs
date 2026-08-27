@@ -20,7 +20,7 @@
 3. **组合优于大对象**：不使用同时代表 HTTP 客户端、登录凭据和用户资料的 `User` 大对象。
 4. **强类型输入**：用枚举、请求结构体和 ID newtype 代替含义不明确的字符串与整数。
 5. **协议与公共模型隔离**：私有 wire DTO 忠实映射服务端字段，公共模型保持 Rust 风格。
-6. **按需共享所有权**：异步本身不是使用 `Arc` 的理由；只有出现真实的多所有者需求时才引入它。
+6. **借用优先**：`Session` 借用创建它的 `Client`，由编译器静态保证父子生命周期；异步本身不是使用 `Arc` 的理由。
 7. **显式副作用**：可能产生多次网络请求、重试或修改服务端状态的行为应当可以从 API 和文档中识别。
 8. **渐进式类型化**：已确认的响应使用具体类型，暂不稳定的字段允许先保留为 `serde_json::Value`。
 
@@ -109,7 +109,6 @@ tests/
 `Client` 表示访问 Physics-Lab 服务所需的网络环境，不包含登录凭据或用户资料。
 
 ```rust
-#[derive(Clone)]
 pub struct Client {
     http: reqwest::Client,
     config: ClientConfig,
@@ -159,22 +158,22 @@ pub struct Endpoints {
 `Session` 表示一次已经完成的登录。需要 Token 或 AuthCode 的接口都放在 `Session` 上。
 
 ```rust
-pub struct Session {
-    client: Client,
+pub struct Session<'client> {
+    client: &'client Client,
     credentials: Credentials,
     current_user: CurrentUser,
 }
 ```
 
-登录时克隆 `Client`：
+登录返回一个生命周期绑定到 `Client` 的借用型 Session：
 
 ```rust
 impl Client {
-    pub async fn anonymous_login(&self) -> Result<Session, Error> {
+    pub async fn anonymous_login(&self) -> Result<Session<'_>, Error> {
         let response = self.authenticate_anonymously().await?;
 
         Ok(Session {
-            client: self.clone(),
+            client: self,
             credentials: response.credentials,
             current_user: response.user,
         })
@@ -182,15 +181,15 @@ impl Client {
 }
 ```
 
-这里 `reqwest::Client` 的克隆会继续共享其底层连接池。SDK 不额外包裹 `Arc<ClientInner>`，除非以后出现共享限流器、动态凭据或其他必须保持同一身份的共享状态。
+其核心约束为：
 
-`Session` 默认不实现 `Clone`，以避免无意复制认证信息。如果应用确实需要把它放入多个 `'static` 后台任务，可以由应用显式使用 `Arc<Session>`。
+- `Session` 不能比创建它的 `Client` 活得更久；
+- `Session` 存活期间不能移动或销毁该 `Client`；
+- SDK 不克隆 `Client`，也不在这一层引入 `Arc`；
+- 凭据只属于 Session，不会因复制 Client 而扩散；
+- 该模型鼓励所有并发工作在 Client 所在的结构化作用域内完成。
 
-```rust
-let session = Arc::new(session);
-```
-
-普通并发调用不需要 `Arc`：
+同一 Session 上的普通并发调用仍然不需要共享所有权：
 
 ```rust
 let (comments, messages) = tokio::join!(
@@ -198,6 +197,10 @@ let (comments, messages) = tokio::join!(
     session.get_messages(),
 );
 ```
+
+代价是 Session 不能引用函数内部创建的 Client 后再从函数返回，也不能直接进入要求 `'static` 的后台任务。把 `Arc` 包在 `Session<'_>` 外面并不能延长它所借用的 Client 生命周期。需要后台任务时，应让任务自己拥有完整的 Client 生命周期，并在任务内部完成登录和后续请求。
+
+当前架构不提供拥有型 Session。只有在真实使用场景证明借用模型无法满足需求后，才重新评估这一边界。
 
 ## 6. Credentials 与敏感信息
 
@@ -361,7 +364,7 @@ Transport 层统一负责：
 `Session` 内部可以提供认证请求构造器：
 
 ```rust
-impl Session {
+impl Session<'_> {
     fn authenticated_post(&self, path: &str) -> reqwest::RequestBuilder {
         self.client
             .post(path)
@@ -500,7 +503,7 @@ blocking = []
 5. 评论、关注、收藏等修改接口；
 6. 分页 Stream 与有限重试；
 7. 图片下载、上传和作品发布；
-8. 在出现真实需求后，再评估共享限流、Token 刷新和 SDK 内部 `Arc`。
+8. 在出现真实需求后，再评估共享限流、Token 刷新或拥有型 Session；当前不为它们预设 `Arc`。
 
 ## 18. 最终调用体验
 
@@ -541,4 +544,4 @@ transport    = HTTP、认证头、编码和错误处理
 stream       = 建立在单页 API 之上的分页便利层
 ```
 
-在没有真实共享所有权需求前，SDK 自身不额外使用 `Arc`；如果应用需要跨后台任务共享 `Session`，由应用显式选择 `Arc<Session>`。
+`Session<'client>` 始终借用 `Client`。在没有新的架构决策前，SDK 不提供拥有型 Session，也不通过 `Arc` 隐藏这条生命周期关系。
