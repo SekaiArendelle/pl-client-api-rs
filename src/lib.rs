@@ -201,6 +201,49 @@ impl<'client> Session<'client> {
     pub fn statistic(&self) -> &Value {
         &self.statistic
     }
+
+    /// Gets an experiment or discussion summary.
+    ///
+    /// The complete API response is returned because the summary payload has
+    /// not been stabilized as a public Rust model yet.
+    pub async fn get_summary(&self, content_id: &str, category: Category) -> Result<Value, Error> {
+        let request = GetSummaryRequest {
+            content_id,
+            category,
+        };
+
+        let response = self
+            .authenticated_post("Contents/GetSummary")
+            .json(&request)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+
+        check_api_response(&response)?;
+        Ok(response)
+    }
+
+    fn authenticated_post(&self, path: &str) -> reqwest::RequestBuilder {
+        self.client
+            .http
+            .post(
+                self.client
+                    .api_base_url
+                    .join(path)
+                    .expect("a validated base URL must join an endpoint path"),
+            )
+            .header("x-API-Token", self.token.as_deref().unwrap_or("null"))
+            .header("x-API-AuthCode", &self.auth_code)
+    }
+}
+
+/// A community content category understood by the Physics-Lab API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum Category {
+    Experiment,
+    Discussion,
 }
 
 /// The user fields included in the authentication response.
@@ -226,7 +269,7 @@ pub enum Error {
     #[error("Physics-Lab API returned status {status}: {message}")]
     Api { status: i64, message: String },
 
-    #[error("successful authentication response is missing `{0}`")]
+    #[error("API response is missing required field `{0}`")]
     MissingField(&'static str),
 
     #[error("invalid API base URL `{value}`: {reason}")]
@@ -247,6 +290,14 @@ struct AuthenticateRequest<'a> {
 struct Device<'a> {
     identifier: &'a str,
     language: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct GetSummaryRequest<'a> {
+    #[serde(rename = "ContentID")]
+    content_id: &'a str,
+    category: Category,
 }
 
 #[derive(Deserialize)]
@@ -320,6 +371,25 @@ impl AuthenticateResponse {
     }
 }
 
+fn check_api_response(response: &Value) -> Result<(), Error> {
+    let status = response
+        .get("Status")
+        .and_then(Value::as_i64)
+        .ok_or(Error::MissingField("Status"))?;
+
+    if status == 200 {
+        return Ok(());
+    }
+
+    let message = response
+        .get("Message")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown server error")
+        .to_owned();
+
+    Err(Error::Api { status, message })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,6 +443,41 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn get_summary_request_matches_the_python_client() {
+        let request = GetSummaryRequest {
+            content_id: "summary-id",
+            category: Category::Experiment,
+        };
+
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            json!({
+                "ContentID": "summary-id",
+                "Category": "Experiment"
+            })
+        );
+    }
+
+    #[test]
+    fn api_status_is_checked() {
+        assert!(check_api_response(&json!({ "Status": 200 })).is_ok());
+
+        let error = check_api_response(&json!({
+            "Status": 404,
+            "Message": "not found"
+        }))
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::Api {
+                status: 404,
+                message
+            } if message == "not found"
+        ));
     }
 
     #[test]
