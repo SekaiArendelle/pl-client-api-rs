@@ -9,7 +9,6 @@ const DEFAULT_PLAR_VERSION: u32 = 2411;
 const DEFAULT_DEVICE_ID: &str = "7db01528cf13e2199e141c402d79190e";
 
 /// An asynchronous client for the Physics-Lab API.
-#[derive(Clone)]
 pub struct Client {
     http: reqwest::Client,
     base_url: String,
@@ -36,7 +35,9 @@ impl Client {
     }
 
     /// Logs in anonymously and returns the session and current-user snapshot.
-    pub async fn anonymous_login(&self) -> Result<Session, Error> {
+    ///
+    /// The returned session borrows this client and therefore cannot outlive it.
+    pub async fn anonymous_login(&self) -> Result<Session<'_>, Error> {
         let request = AuthenticateRequest {
             login: None,
             password: None,
@@ -57,14 +58,19 @@ impl Client {
             .json::<AuthenticateResponse>()
             .await?;
 
-        Session::try_from(response)
+        response.into_session(self)
     }
 }
 
 /// Information returned by a successful login.
 ///
+/// A session borrows the client that created it. This keeps their lifetime
+/// relationship explicit and lets Rust prevent the client from being dropped
+/// while the session is still in use.
+///
 /// Credentials are intentionally private so they are not printed accidentally.
-pub struct Session {
+pub struct Session<'client> {
+    client: &'client Client,
     token: Option<String>,
     auth_code: String,
     device_token: Option<String>,
@@ -72,7 +78,11 @@ pub struct Session {
     statistic: Value,
 }
 
-impl Session {
+impl<'client> Session<'client> {
+    pub fn client(&self) -> &'client Client {
+        self.client
+    }
+
     pub fn token(&self) -> Option<&str> {
         self.token.as_deref()
     }
@@ -172,24 +182,23 @@ struct WireUser {
     verification: Value,
 }
 
-impl TryFrom<AuthenticateResponse> for Session {
-    type Error = Error;
-
-    fn try_from(response: AuthenticateResponse) -> Result<Self, Self::Error> {
-        if response.status != 200 {
+impl AuthenticateResponse {
+    fn into_session<'client>(self, client: &'client Client) -> Result<Session<'client>, Error> {
+        if self.status != 200 {
             return Err(Error::Api {
-                status: response.status,
-                message: response
+                status: self.status,
+                message: self
                     .message
                     .unwrap_or_else(|| "unknown server error".to_owned()),
             });
         }
 
-        let auth_code = response.auth_code.ok_or(Error::MissingField("AuthCode"))?;
-        let data = response.data.ok_or(Error::MissingField("Data"))?;
+        let auth_code = self.auth_code.ok_or(Error::MissingField("AuthCode"))?;
+        let data = self.data.ok_or(Error::MissingField("Data"))?;
 
-        Ok(Self {
-            token: response.token,
+        Ok(Session {
+            client,
+            token: self.token,
             auth_code,
             device_token: data.device_token,
             current_user: CurrentUser {
@@ -266,8 +275,10 @@ mod tests {
         }))
         .unwrap();
 
-        let session = Session::try_from(response).unwrap();
+        let client = Client::new().unwrap();
+        let session = response.into_session(&client).unwrap();
 
+        assert!(std::ptr::eq(session.client(), &client));
         assert_eq!(session.auth_code(), "auth-code");
         assert_eq!(session.current_user().id, "user-id");
         assert_eq!(
