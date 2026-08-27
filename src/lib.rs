@@ -4,34 +4,129 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-const DEFAULT_BASE_URL: &str = "https://physics-api-cn.turtlesim.com";
-const DEFAULT_PLAR_VERSION: u32 = 2411;
-const DEFAULT_DEVICE_ID: &str = "7db01528cf13e2199e141c402d79190e";
-
 /// An asynchronous client for the Physics-Lab API.
 pub struct Client {
     http: reqwest::Client,
-    base_url: String,
+    api_base_url: reqwest::Url,
+    plar_version: u32,
+    device_id: String,
+    language: String,
+}
+
+/// Configures and constructs a [`Client`].
+pub struct ClientBuilder {
+    api_base_url: String,
+    request_timeout: Duration,
+    plar_version: u32,
+    device_id: String,
+    language: String,
+}
+
+impl Default for ClientBuilder {
+    fn default() -> Self {
+        Self {
+            api_base_url: "https://physics-api-cn.turtlesim.com".to_owned(),
+            request_timeout: Duration::from_secs(15),
+            plar_version: 2411,
+            device_id: "7db01528cf13e2199e141c402d79190e".to_owned(),
+            language: "Chinese".to_owned(),
+        }
+    }
+}
+
+impl ClientBuilder {
+    /// Overrides the Physics-Lab API base URL.
+    ///
+    /// A custom URL is useful when running integration tests against a local
+    /// mock server. It is parsed and validated by [`Self::build`].
+    pub fn api_base_url(mut self, api_base_url: impl Into<String>) -> Self {
+        self.api_base_url = api_base_url.into();
+        self
+    }
+
+    /// Sets the total timeout for each HTTP request.
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
+        self
+    }
+
+    /// Sets the Physics-Lab client version sent during authentication.
+    pub fn plar_version(mut self, version: u32) -> Self {
+        self.plar_version = version;
+        self
+    }
+
+    /// Sets the device identifier sent during authentication.
+    pub fn device_id(mut self, device_id: impl Into<String>) -> Self {
+        self.device_id = device_id.into();
+        self
+    }
+
+    /// Sets the language sent during authentication.
+    pub fn language(mut self, language: impl Into<String>) -> Self {
+        self.language = language.into();
+        self
+    }
+
+    /// Validates the configuration and constructs a client.
+    pub fn build(self) -> Result<Client, Error> {
+        let mut api_base_url =
+            reqwest::Url::parse(&self.api_base_url).map_err(|error| Error::InvalidBaseUrl {
+                value: self.api_base_url.clone(),
+                reason: error.to_string(),
+            })?;
+
+        if !matches!(api_base_url.scheme(), "http" | "https")
+            || api_base_url.cannot_be_a_base()
+            || api_base_url.host_str().is_none()
+        {
+            return Err(Error::InvalidBaseUrl {
+                value: self.api_base_url,
+                reason: "expected an absolute HTTP or HTTPS URL with a host".to_owned(),
+            });
+        }
+
+        if api_base_url.query().is_some() || api_base_url.fragment().is_some() {
+            return Err(Error::InvalidBaseUrl {
+                value: self.api_base_url,
+                reason: "query strings and fragments are not allowed".to_owned(),
+            });
+        }
+
+        if !api_base_url.path().ends_with('/') {
+            let mut path = api_base_url.path().to_owned();
+            path.push('/');
+            api_base_url.set_path(&path);
+        }
+
+        let http = reqwest::Client::builder()
+            .timeout(self.request_timeout)
+            .build()?;
+
+        Ok(Client {
+            http,
+            api_base_url,
+            plar_version: self.plar_version,
+            device_id: self.device_id,
+            language: self.language,
+        })
+    }
 }
 
 impl Client {
     /// Creates a client configured for the production Physics-Lab API.
     pub fn new() -> Result<Self, Error> {
-        Self::with_base_url(DEFAULT_BASE_URL)
+        Self::builder().build()
     }
 
-    /// Creates a client with a custom base URL.
-    ///
-    /// This is mainly useful for tests that run against a local mock server.
-    pub fn with_base_url(base_url: impl Into<String>) -> Result<Self, Error> {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .build()?;
+    /// Starts building a client from the default configuration.
+    pub fn builder() -> ClientBuilder {
+        ClientBuilder::default()
+    }
 
-        Ok(Self {
-            http,
-            base_url: base_url.into().trim_end_matches('/').to_owned(),
-        })
+    /// Returns the normalized API base URL.
+    pub fn api_base_url(&self) -> &reqwest::Url {
+        &self.api_base_url
     }
 
     /// Logs in anonymously and returns the session and current-user snapshot.
@@ -41,16 +136,20 @@ impl Client {
         let request = AuthenticateRequest {
             login: None,
             password: None,
-            version: DEFAULT_PLAR_VERSION,
+            version: self.plar_version,
             device: Device {
-                identifier: DEFAULT_DEVICE_ID,
-                language: "Chinese",
+                identifier: &self.device_id,
+                language: &self.language,
             },
         };
 
         let response = self
             .http
-            .post(format!("{}/Users/Authenticate", self.base_url))
+            .post(
+                self.api_base_url
+                    .join("Users/Authenticate")
+                    .expect("a validated base URL must join a static endpoint path"),
+            )
             .json(&request)
             .send()
             .await?
@@ -129,6 +228,9 @@ pub enum Error {
 
     #[error("successful authentication response is missing `{0}`")]
     MissingField(&'static str),
+
+    #[error("invalid API base URL `{value}`: {reason}")]
+    InvalidBaseUrl { value: String, reason: String },
 }
 
 #[derive(Serialize)]
@@ -224,13 +326,37 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn builder_normalizes_a_custom_base_url() {
+        let client = Client::builder()
+            .api_base_url("http://127.0.0.1:3000/api")
+            .timeout(Duration::from_secs(1))
+            .plar_version(2501)
+            .device_id("test-device")
+            .language("English")
+            .build()
+            .unwrap();
+
+        assert_eq!(client.api_base_url().as_str(), "http://127.0.0.1:3000/api/");
+        assert_eq!(client.plar_version, 2501);
+        assert_eq!(client.device_id, "test-device");
+        assert_eq!(client.language, "English");
+    }
+
+    #[test]
+    fn builder_rejects_an_invalid_base_url() {
+        let result = Client::builder().api_base_url("not a URL").build();
+
+        assert!(matches!(result, Err(Error::InvalidBaseUrl { .. })));
+    }
+
+    #[test]
     fn anonymous_request_matches_the_python_client() {
         let request = AuthenticateRequest {
             login: None,
             password: None,
-            version: DEFAULT_PLAR_VERSION,
+            version: 2411,
             device: Device {
-                identifier: DEFAULT_DEVICE_ID,
+                identifier: "7db01528cf13e2199e141c402d79190e",
                 language: "Chinese",
             },
         };
