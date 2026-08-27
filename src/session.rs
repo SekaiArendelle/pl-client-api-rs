@@ -3,7 +3,86 @@ use serde_json::Value;
 
 use crate::client::Client;
 use crate::error::Error;
-use crate::models::{Category, CurrentUser};
+use crate::models::{Category, CurrentUser, Tag};
+
+/// Filters and pagination for [`Session::query_experiments`].
+#[derive(Debug, Clone)]
+pub struct QueryExperimentsOptions {
+    category: Category,
+    tags: Option<Vec<Tag>>,
+    exclude_tags: Option<Vec<Tag>>,
+    languages: Vec<String>,
+    exclude_languages: Vec<String>,
+    user_id: Option<String>,
+    take: u32,
+    skip: u32,
+    from_skip: Option<String>,
+}
+
+impl QueryExperimentsOptions {
+    /// Creates a query with the API defaults: 20 results starting at offset 0.
+    pub fn new(category: Category) -> Self {
+        Self {
+            category,
+            tags: None,
+            exclude_tags: None,
+            languages: Vec::new(),
+            exclude_languages: Vec::new(),
+            user_id: None,
+            take: 20,
+            skip: 0,
+            from_skip: None,
+        }
+    }
+
+    pub fn tags(mut self, tags: impl IntoIterator<Item = Tag>) -> Self {
+        self.tags = Some(tags.into_iter().collect());
+        self
+    }
+
+    pub fn exclude_tags(mut self, tags: impl IntoIterator<Item = Tag>) -> Self {
+        self.exclude_tags = Some(tags.into_iter().collect());
+        self
+    }
+
+    pub fn languages<I, S>(mut self, languages: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.languages = languages.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn exclude_languages<I, S>(mut self, languages: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.exclude_languages = languages.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn user_id(mut self, user_id: impl Into<String>) -> Self {
+        self.user_id = Some(user_id.into());
+        self
+    }
+
+    pub fn take(mut self, take: u32) -> Self {
+        self.take = take;
+        self
+    }
+
+    pub fn skip(mut self, skip: u32) -> Self {
+        self.skip = skip;
+        self
+    }
+
+    pub fn from_skip(mut self, from_skip: impl Into<String>) -> Self {
+        self.from_skip = Some(from_skip.into());
+        self
+    }
+}
 
 /// Information returned by a successful login.
 ///
@@ -62,6 +141,48 @@ impl<'client> Session<'client> {
 
     pub fn statistic(&self) -> &Value {
         &self.statistic
+    }
+
+    /// Queries experiments or discussions using the supplied filters.
+    ///
+    /// The complete API response is returned because the result payload has
+    /// not been stabilized as a public Rust model yet.
+    pub async fn query_experiments(
+        &self,
+        options: QueryExperimentsOptions,
+    ) -> Result<Value, Error> {
+        let request = QueryExperimentsRequest {
+            query: QueryExperimentsQuery {
+                category: options.category,
+                languages: &options.languages,
+                exclude_languages: &options.exclude_languages,
+                tags: options.tags.as_deref(),
+                exclude_tags: options.exclude_tags.as_deref(),
+                model_tags: None,
+                model_id: None,
+                parent_id: None,
+                user_id: options.user_id.as_deref(),
+                special: None,
+                from_skip: options.from_skip.as_deref(),
+                skip: options.skip,
+                take: options.take,
+                days: 0,
+                sort: 0,
+                show_announcement: false,
+            },
+        };
+
+        let response = self
+            .authenticated_post("Contents/QueryExperiments")
+            .json(&request)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+
+        check_api_response(&response)?;
+        Ok(response)
     }
 
     /// Gets an experiment or discussion summary.
@@ -145,6 +266,37 @@ struct GetSummaryRequest<'a> {
 struct GetExperimentRequest<'a> {
     #[serde(rename = "ContentID")]
     content_id: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct QueryExperimentsRequest<'a> {
+    query: QueryExperimentsQuery<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct QueryExperimentsQuery<'a> {
+    category: Category,
+    languages: &'a [String],
+    exclude_languages: &'a [String],
+    tags: Option<&'a [Tag]>,
+    exclude_tags: Option<&'a [Tag]>,
+    model_tags: Option<()>,
+    #[serde(rename = "ModelID")]
+    model_id: Option<()>,
+    #[serde(rename = "ParentID")]
+    parent_id: Option<()>,
+    #[serde(rename = "UserID")]
+    user_id: Option<&'a str>,
+    special: Option<()>,
+    #[serde(rename = "From")]
+    from_skip: Option<&'a str>,
+    skip: u32,
+    take: u32,
+    days: u32,
+    sort: u32,
+    show_announcement: bool,
 }
 
 fn check_api_response(response: &Value) -> Result<(), Error> {
