@@ -225,6 +225,44 @@ impl<'client> Session<'client> {
         Ok(response)
     }
 
+    /// Gets an experiment from an experiment or discussion identifier.
+    ///
+    /// This first resolves the identifier through [`Self::get_summary`], then
+    /// uses the `ContentID` returned by that endpoint to fetch the experiment.
+    pub async fn get_experiment(
+        &self,
+        experiment_id: &str,
+        category: Category,
+    ) -> Result<Value, Error> {
+        let content_id = {
+            let summary = self.get_summary(experiment_id, category).await?;
+            summary_content_id(&summary)?.to_owned()
+        };
+
+        self.get_experiment_by_content_id(&content_id).await
+    }
+
+    /// Gets an experiment when its resolved `ContentID` is already known.
+    ///
+    /// Most callers should use [`Self::get_experiment`]. This method avoids an
+    /// unnecessary summary request when the API-level content identifier is
+    /// already available.
+    pub async fn get_experiment_by_content_id(&self, content_id: &str) -> Result<Value, Error> {
+        let request = GetExperimentRequest { content_id };
+
+        let response = self
+            .authenticated_post("Contents/GetExperiment")
+            .json(&request)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+
+        check_api_response(&response)?;
+        Ok(response)
+    }
+
     fn authenticated_post(&self, path: &str) -> reqwest::RequestBuilder {
         self.client
             .http
@@ -298,6 +336,12 @@ struct GetSummaryRequest<'a> {
     #[serde(rename = "ContentID")]
     content_id: &'a str,
     category: Category,
+}
+
+#[derive(Serialize)]
+struct GetExperimentRequest<'a> {
+    #[serde(rename = "ContentID")]
+    content_id: &'a str,
 }
 
 #[derive(Deserialize)]
@@ -390,6 +434,13 @@ fn check_api_response(response: &Value) -> Result<(), Error> {
     Err(Error::Api { status, message })
 }
 
+fn summary_content_id(summary: &Value) -> Result<&str, Error> {
+    summary
+        .pointer("/Data/ContentID")
+        .and_then(Value::as_str)
+        .ok_or(Error::MissingField("Data.ContentID"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,6 +510,32 @@ mod tests {
                 "Category": "Experiment"
             })
         );
+    }
+
+    #[test]
+    fn get_experiment_request_matches_the_python_client() {
+        let request = GetExperimentRequest {
+            content_id: "resolved-content-id",
+        };
+
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            json!({ "ContentID": "resolved-content-id" })
+        );
+    }
+
+    #[test]
+    fn summary_content_id_is_extracted() {
+        let summary = json!({
+            "Status": 200,
+            "Data": { "ContentID": "resolved-content-id" }
+        });
+
+        assert_eq!(summary_content_id(&summary).unwrap(), "resolved-content-id");
+        assert!(matches!(
+            summary_content_id(&json!({ "Status": 200 })),
+            Err(Error::MissingField("Data.ContentID"))
+        ));
     }
 
     #[test]
